@@ -79,7 +79,14 @@ body {
   font-size: 15px;
   line-height: 1.5;
 }
-.wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
+.wrap {
+  max-width: 1100px; margin: 0 auto; padding-block: 16px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.inline-in { width: auto; min-height: 32px; padding: 2px 6px; font-size: 14px; }
+textarea { font: 13px/1.4 ui-monospace, Menlo, monospace; width: 100%; min-height: 80px; padding: 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--text); }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 h1 { font-size: 20px; margin: 0 0 4px; }
 h2 { font-size: 16px; margin: 0 0 12px; }
 .muted { color: var(--text-2); }
@@ -108,6 +115,7 @@ h2 { font-size: 16px; margin: 0 0 12px; }
   display: inline-flex; align-items: center; gap: 4px;
   font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap;
 }
+.msg .badge { white-space: normal; border-radius: 8px; }
 .badge.good { background: var(--good-bg); color: var(--good); }
 .badge.warn { background: var(--warn-bg); color: var(--warn); }
 .badge.bad { background: var(--bad-bg); color: var(--bad); }
@@ -245,7 +253,7 @@ label.f { display: block; font-size: 13px; color: var(--text-2); margin-bottom: 
             </label>
           </div>
           <button class="primary" type="submit">미팅 저장</button>
-          <div id="mtgWarn" class="small" style="margin-top:8px"></div>
+          <div id="mtgWarn" class="small msg" style="margin-top:8px"></div>
         </form>
         <h2 style="margin-top:16px">이미 만난 회사 (소진) 추가</h2>
         <div class="small muted" style="margin-bottom:8px">이 대시보드 이전에 이미 미팅한 회사. 이후 미팅은 0명으로 처리됩니다.</div>
@@ -277,10 +285,20 @@ label.f { display: block; font-size: 13px; color: var(--text-2); margin-bottom: 
     </label>
     <div class="btn-row">
       <button id="exportBtn">JSON 내보내기</button>
-      <label class="btn">JSON 가져오기<input type="file" id="importFile" accept="application/json" style="display:none"></label>
+      <label class="btn">JSON 파일 가져오기<input type="file" id="importFile" accept="application/json,.json" style="display:none"></label>
       <button id="resetBtn" class="danger">초기 데이터로 리셋</button>
     </div>
-    <div class="small muted" id="storageNote"></div>
+    <div class="small" id="ioStatus" role="status"></div>
+    <details id="ioBox">
+      <summary>JSON 직접 복사 / 붙여넣기</summary>
+      <textarea id="ioText" aria-label="백업 JSON"></textarea>
+      <div class="btn-row" style="margin-top:8px">
+        <button id="ioFill">현재 데이터 표시</button>
+        <button id="ioCopy">복사</button>
+        <button id="ioLoad">붙여넣은 JSON 가져오기</button>
+      </div>
+    </details>
+    <div class="small muted" id="storageNote" style="margin-top:8px"></div>
   </section>
 </div>
 
@@ -534,8 +552,10 @@ function meetingSeries(state, today) {
 
 <script>
 // ===== 저장 =====
+// 클라이언트 저장소(db)를 쓸 수 있으면 그곳에, 아니면 브라우저 localStorage 에 저장.
 const STORE_KEY = 'rwj-apprentice-kpi-v1';
 let storageOk = true;
+let remoteDoc = null, remoteErr = '', remoteWriting = false, remotePending = false;
 function load() {
   try {
     const raw = localStorage.getItem(STORE_KEY);
@@ -546,6 +566,36 @@ function load() {
 function save() {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
   catch (e) { storageOk = false; }
+  if (remoteDoc) flushRemote();
+}
+async function flushRemote() {
+  if (remoteWriting) { remotePending = true; return; }
+  remoteWriting = true;
+  try { await remoteDoc.set({ json: JSON.stringify(state), savedAt: new Date().toISOString() }); remoteErr = ''; }
+  catch (e) { remoteErr = (e && e.code) || '저장 실패'; }
+  remoteWriting = false;
+  if (remotePending) { remotePending = false; flushRemote(); }
+  renderStorageNote();
+}
+async function initRemote() {
+  if (!window.claude || !window.claude.use) return;
+  const [db, user] = await Promise.all([window.claude.use('db'), window.claude.use('user')]);
+  if (!db || !user) return;
+  const uid = await user.id();
+  if (!uid) return;
+  const ref = db.doc('data/users/' + uid + '/kpi');
+  try {
+    const snap = await ref.get();
+    const data = snap.exists ? snap.data() : null;
+    remoteDoc = ref;
+    if (data && typeof data.json === 'string') {
+      state = { ...initialState(), ...JSON.parse(data.json) };
+      try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) { storageOk = false; }
+    } else {
+      await flushRemote();
+    }
+  } catch (e) { remoteErr = (e && e.code) || '불러오기 실패'; }
+  render();
 }
 let state = load();
 
@@ -582,7 +632,13 @@ function render() {
   renderCompanies();
   renderRecords();
   document.getElementById('permBasis').value = state.permBasis || '';
-  document.getElementById('storageNote').textContent = storageOk
+  renderStorageNote();
+}
+function renderStorageNote() {
+  const el = document.getElementById('storageNote');
+  if (remoteDoc && !remoteErr) el.textContent = '데이터는 내 계정에 자동 저장됩니다 (다른 컴퓨터·휴대폰에서 이 페이지를 열어도 같은 데이터). 나만 볼 수 있습니다.';
+  else if (remoteDoc) el.textContent = `계정 저장 실패 (${remoteErr}). 이 브라우저에는 저장되었습니다. 중요한 변경 후에는 JSON 백업을 해 두세요.`;
+  else el.textContent = storageOk
     ? '데이터는 이 브라우저(localStorage)에 자동 저장됩니다. 다른 기기로 옮기려면 JSON 내보내기/가져오기를 사용하세요.'
     : '이 환경에서는 브라우저 저장이 불가능합니다. 새로고침 전에 반드시 JSON 내보내기를 하세요.';
 }
@@ -746,10 +802,10 @@ function renderRecords() {
     const st = m.status === 'planned' ? '<span class="tag plan">예정</span>' : '<span class="tag">완료</span>';
     const zero = r.counted === 0 && m.people > 0 ? ` <span class="tag zero">0명 (${esc(r.reason)})</span>` : '';
     const nonWd = m.date && !isWorkday(m.date) ? ' <span class="tag zero">날짜 확인 필요</span>' : '';
-    const name = m.company ? esc(m.company) + (m.dept ? ' / ' + esc(m.dept) : '') : '<em>회사명 미입력</em>';
+    const name = `<input class="inline-in" data-mcompany="${m.id}" value="${esc(m.company)}" placeholder="회사명 입력" aria-label="회사명" size="12">` + (m.dept ? ' / ' + esc(m.dept) : '');
     const actions = (m.status === 'planned' ? `<button class="link" data-mdone="${m.id}">완료 처리</button>` : '') +
-      `<button class="link" data-medit="${m.id}">회사명 수정</button><button class="link danger" data-mdel="${m.id}">삭제</button>`;
-    return `<li><span>${fmtMD(m.date)} ${name} · ${m.people}명 ${st}${zero}${nonWd}</span><span>${actions}</span></li>`;
+      `<button class="link danger" data-mdel="${m.id}">삭제</button>`;
+    return `<li><span><input type="date" class="inline-in" data-mdate="${m.id}" value="${m.date || ''}" aria-label="미팅 날짜"> ${name} · ${m.people}명 ${st}${zero}${nonWd}</span><span>${actions}</span></li>`;
   }).join('') : '<li class="muted">기록 없음</li>'}</ul></div>`;
   for (const k of groups) {
     const items = state.entries.filter(e => e.kpi === k).sort((a, b) => cmpDate(a.date, b.date) || a.id - b.id);
@@ -758,7 +814,7 @@ function renderRecords() {
       const nonWd = e.date && !isWorkday(e.date) ? ' <span class="tag zero">날짜 확인 필요</span>' : '';
       const actions = (e.status === 'planned' ? `<button class="link" data-edone="${e.id}">완료 처리</button>` : '') +
         `<button class="link danger" data-edel="${e.id}">삭제</button>`;
-      return `<li><span>${e.date ? fmtMD(e.date) : '날짜 모름'} ${st}${nonWd}${e.note ? ' <span class="small muted">' + esc(e.note) + '</span>' : ''}</span><span>${actions}</span></li>`;
+      return `<li><span><input type="date" class="inline-in" data-edate="${e.id}" value="${e.date || ''}" aria-label="날짜">${e.date ? '' : ' 날짜 모름'} ${st}${nonWd}${e.note ? ' <span class="small muted">' + esc(e.note) + '</span>' : ''}</span><span>${actions}</span></li>`;
     }).join('') : '<li class="muted">기록 없음</li>'}</ul></div>`;
   }
   document.getElementById('records').innerHTML = html;
@@ -775,33 +831,52 @@ document.addEventListener('click', e => {
     state.entries.push({ id: ++state.seq, kpi: d.add, date: today(), status: 'done', note: '', recorded: today() });
     update();
   } else if (d.edone) {
+    // 날짜는 예정일 그대로. 바꾸려면 기록 옆 날짜 칸을 수정.
     const it = state.entries.find(x => x.id === +d.edone);
-    const dt = prompt('완료 날짜 (YYYY-MM-DD)', it.date || today());
-    if (!dt || !/^\d{4}-\d{2}-\d{2}$/.test(dt)) return;
-    it.date = dt; it.status = 'done'; update();
+    if (!it.date) it.date = today();
+    it.status = 'done'; update();
   } else if (d.edel) {
-    if (!confirm('이 기록을 삭제할까요?')) return;
+    if (!confirmTwice(b)) return;
     state.entries = state.entries.filter(x => x.id !== +d.edel); update();
   } else if (d.mdone) {
     const it = state.meetings.find(x => x.id === +d.mdone);
     if (!normCompany(it.company)) {
-      const c = prompt('회사명을 입력하세요 (중복 판정에 필요)');
-      if (!c) return;
-      it.company = c.trim();
+      const inp = document.querySelector(`[data-mcompany="${it.id}"]`);
+      inp.focus();
+      inp.setCustomValidity('회사명을 먼저 입력하세요 (중복 판정에 필요)');
+      inp.reportValidity();
+      inp.addEventListener('input', () => inp.setCustomValidity(''), { once: true });
+      return;
     }
-    if (isRegistered(it.company, it.id)) alert(`"${it.company}"은(는) 이미 등록된 회사입니다. 이 미팅은 0명으로 처리됩니다.`);
     it.status = 'done'; update();
-  } else if (d.medit) {
-    const it = state.meetings.find(x => x.id === +d.medit);
-    const c = prompt('회사명', it.company);
-    if (c === null) return;
-    it.company = c.trim(); update();
   } else if (d.mdel) {
-    if (!confirm('이 미팅을 삭제할까요?')) return;
+    if (!confirmTwice(b)) return;
     state.meetings = state.meetings.filter(x => x.id !== +d.mdel); update();
   } else if (d.unuse) {
     state.usedCompanies = state.usedCompanies.filter(c => c !== d.unuse); update();
   }
+});
+
+// 브라우저 확인창 대신: 첫 클릭은 버튼을 "정말?"으로 바꾸고, 3초 안에 다시 누르면 실행.
+function confirmTwice(b) {
+  if (b.dataset.armed === '1') return true;
+  const label = b.textContent;
+  b.dataset.armed = '1';
+  b.textContent = '한 번 더 누르면 실행';
+  setTimeout(() => { if (b.isConnected) { b.dataset.armed = ''; b.textContent = label; } }, 3000);
+  return false;
+}
+
+document.getElementById('records').addEventListener('change', e => {
+  const t = e.target, d = t.dataset;
+  if (d.mcompany) {
+    state.meetings.find(x => x.id === +d.mcompany).company = t.value.trim();
+  } else if (d.mdate && t.value) {
+    state.meetings.find(x => x.id === +d.mdate).date = t.value;
+  } else if (d.edate && t.value) {
+    state.entries.find(x => x.id === +d.edate).date = t.value;
+  } else return;
+  update();
 });
 
 function isRegistered(company, exceptId) {
@@ -821,17 +896,17 @@ document.getElementById('mtgForm').addEventListener('submit', e => {
   const company = document.getElementById('mtgCompany').value.trim();
   const people = Math.max(0, parseInt(document.getElementById('mtgPeople').value, 10) || 0);
   const date = document.getElementById('mtgDate').value;
-  if (isRegistered(company)) {
-    if (!confirm(`"${company}"은(는) 이미 등록된 회사입니다.\n회사당 첫 미팅만 인정되므로 이 미팅은 0명으로 처리됩니다.\n그래도 기록할까요?`)) return;
-  }
+  const dup = isRegistered(company);
   state.meetings.push({
     id: ++state.seq, date, company, dept: document.getElementById('mtgDept').value.trim(), people,
     status: document.getElementById('mtgStatus').value, recorded: today()
   });
   e.target.reset();
-  document.getElementById('mtgWarn').innerHTML = '';
   document.getElementById('mtgDate').value = today();
   update();
+  document.getElementById('mtgWarn').innerHTML = dup
+    ? `<span class="badge warn">▲ 저장됨: "${esc(company)}"은(는) 이미 등록된 회사라서 이 미팅은 0명으로 처리했습니다.</span>`
+    : '<span class="badge good">● 저장됨</span>';
 });
 
 document.getElementById('usedForm').addEventListener('submit', e => {
@@ -849,29 +924,57 @@ document.getElementById('simDate').addEventListener('change', e => {
 });
 document.getElementById('simReset').addEventListener('click', () => { state.simDate = ''; update(); });
 
-document.getElementById('exportBtn').addEventListener('click', () => {
-  const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+function ioStatus(msg) { document.getElementById('ioStatus').textContent = msg; }
+function showJson() {
+  document.getElementById('ioText').value = JSON.stringify(state, null, 2);
+  document.getElementById('ioBox').open = true;
+}
+document.getElementById('exportBtn').addEventListener('click', async () => {
+  const json = JSON.stringify(state, null, 2);
+  const filename = `kpi-backup-${today()}.json`;
+  if (window.claude && window.claude.use) {
+    const dl = await window.claude.use('downloads');
+    if (dl) {
+      try { await dl.save({ filename, data: json }); ioStatus('내보내기 완료: ' + filename); }
+      catch (err) { ioStatus(err && err.code === 'declined' ? '내보내기를 취소했습니다.' : '파일로 저장할 수 없어 아래에 JSON을 표시했습니다. 복사해서 보관하세요.'); if (!err || err.code !== 'declined') showJson(); }
+      return;
+    }
+    showJson();
+    ioStatus('이 화면에서는 파일 저장이 안 됩니다. 아래 JSON을 복사해서 보관하세요.');
+    return;
+  }
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `kpi-backup-${today()}.json`;
+  a.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+  a.download = filename;
   a.click();
   URL.revokeObjectURL(a.href);
+  ioStatus('내보내기 완료: ' + filename);
 });
-document.getElementById('importFile').addEventListener('change', async e => {
-  const f = e.target.files[0];
-  if (!f) return;
+function importJson(text) {
   try {
-    const data = JSON.parse(await f.text());
-    if (!Array.isArray(data.entries) || !Array.isArray(data.meetings)) throw new Error('형식 오류');
+    const data = JSON.parse(text);
+    if (!Array.isArray(data.entries) || !Array.isArray(data.meetings)) throw new Error('entries / meetings 항목이 없습니다');
     state = { ...initialState(), ...data };
     update();
-    alert('가져오기 완료');
-  } catch (err) { alert('가져오기 실패: ' + err.message); }
+    ioStatus('가져오기 완료');
+  } catch (err) { ioStatus('가져오기 실패: ' + err.message); }
+}
+document.getElementById('importFile').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  if (f) importJson(await f.text());
   e.target.value = '';
 });
-document.getElementById('resetBtn').addEventListener('click', () => {
-  if (!confirm('모든 입력을 지우고 초기 데이터(10/14 기준)로 되돌릴까요?')) return;
+document.getElementById('ioFill').addEventListener('click', showJson);
+document.getElementById('ioLoad').addEventListener('click', () => importJson(document.getElementById('ioText').value));
+document.getElementById('ioCopy').addEventListener('click', () => {
+  const ta = document.getElementById('ioText');
+  if (!ta.value) showJson();
+  navigator.clipboard.writeText(ta.value).then(() => ioStatus('복사했습니다.'), () => { ta.select(); ioStatus('텍스트를 선택했습니다. Ctrl+C로 복사하세요.'); });
+});
+document.getElementById('resetBtn').addEventListener('click', e => {
+  if (!confirmTwice(e.currentTarget)) return;
   state = initialState(); update();
+  ioStatus('초기 데이터로 되돌렸습니다.');
 });
 
 let resizeTimer;
@@ -884,6 +987,7 @@ window.addEventListener('resize', () => {
 });
 
 render();
+initRemote();
 </script>
 </body>
 </html>
